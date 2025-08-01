@@ -4,74 +4,114 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from app.config.config import Config
 from app.models.sync_metadata import SyncMetadata
+import json # JSON 직렬화/역직렬화를 위해 추가
 
 logger = logging.getLogger(__name__)
 
-class StorySyncService:
-    def __init__(self, db: Session):
-        self.db = db
-        self.story_sequencer_url = Config.STORY_SEQUENCER_SERVICE_URL
-        self.service_name = "story-sequencer"
 
-    async def get_last_synced_timestamp(self) -> datetime:
-        metadata = self.db.query(SyncMetadata).filter_by(service_name=self.service_name).first()
-        if metadata and metadata.last_synced_timestamp:
-            return metadata.last_synced_timestamp
-        # 초기 동기화를 위해 매우 오래된 타임스탬프 반환
-        return datetime.min
+async def _get_last_synced_timestamp(db: Session, service_name: str) -> datetime:
+    """마지막 동기화 타임스탬프를 가져옵니다."""
+    metadata = db.query(SyncMetadata).filter_by(service_name=service_name).first()
+    if metadata and metadata.last_synced_timestamp:
+        return metadata.last_synced_timestamp
+    # 초기 동기화를 위해 매우 오래된 타임스탬프 반환
+    return datetime.min
 
-    def update_last_synced_timestamp(self, new_timestamp: datetime):
-        metadata = self.db.query(SyncMetadata).filter_by(service_name=self.service_name).first()
-        if metadata:
-            metadata.last_synced_timestamp = new_timestamp
-        else:
-            self.db.add(SyncMetadata(service_name=self.service_name, last_synced_timestamp=new_timestamp))
-        self.db.commit()
+def _update_last_synced_timestamp(db: Session, service_name: str, new_timestamp: datetime):
+    """마지막 동기화 타임스탬프를 업데이트합니다."""
+    metadata = db.query(SyncMetadata).filter_by(service_name=service_name).first()
+    if metadata:
+        metadata.last_synced_timestamp = new_timestamp
+    else:
+        db.add(SyncMetadata(service_name=service_name, last_synced_timestamp=new_timestamp))
+    db.commit()
 
-    async def fetch_new_stories(self) -> list:
-        last_synced = await self.get_last_synced_timestamp()
-        # story-sequencer API가 updated_after 파라미터를 지원한다고 가정
-        # 만약 지원하지 않는다면, 모든 데이터를 가져와 필터링 로직을 추가해야 함
-        params = {"updated_after": last_synced.isoformat()}
-        
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(f"{self.story_sequencer_url}/api/v0/stories/", params=params)
-                response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
-                return response.json()
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Error fetching stories: {e.response.status_code} - {e.response.text}")
+async def _fetch_new_stories(
+    db: Session,
+    story_sequencer_url: str,
+    service_name: str,
+) -> list:
+    """story-sequencer에서 새로운 스토리를 가져옵니다."""
+    last_synced = await _get_last_synced_timestamp(db, service_name)
+    params = {"updated_after": last_synced.isoformat()}
+    
+    headers = {}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            # 엔드포인트 변경: /api/v0/stories/ -> /internal/stories
+            response = await client.get(f"{story_sequencer_url}/internal/stories", params=params, headers=headers)
+            response.raise_for_status()  # HTTP 오류 (4xx 또는 5xx) 발생 시 예외 발생
+            
+            response_data = response.json()
+            if response_data and "results" in response_data:
+                return response_data["results"]
+            else:
+                logger.warning(f"Story-sequencer response missing 'results' key: {response_data}")
                 return []
-            except httpx.RequestError as e:
-                logger.error(f"Network error fetching stories: {e}")
-                return []
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Error fetching stories: {e.response.status_code} - {e.response.text}")
+            return []
+        except httpx.RequestError as e:
+            logger.error(f"Network error fetching stories: {e}")
+            return []
 
-    def transform_story_to_dify_format(self, story: dict) -> dict:
-        # Dify Document Upload API 형식에 맞게 데이터 변환
-        # user_id를 메타데이터로 포함
-        return {
-            "text": story.get("content", ""),
-            "meta": {
-                "user_id": story.get("user_id"),
-                "story_id": story.get("id"),
-                "title": story.get("title", ""),
-                "created_at": story.get("created_at"),
-                "updated_at": story.get("updated_at"),
-                "source": self.service_name
-            }
+async def _fetch_all_story_ids(
+    story_sequencer_url: str,
+) -> list:
+    """story-sequencer에서 모든 이야기 ID를 가져옵니다."""
+    headers = {}
+    async with httpx.AsyncClient() as client:
+        try:
+            # 엔드포인트: /internal/story-ids
+            response = await client.get(f"{story_sequencer_url}/internal/story-ids", headers=headers)
+            response.raise_for_status()
+            response_data = response.json()
+            if response_data and "results" in response_data:
+                return response_data["results"]
+            else:
+                logger.warning(f"Story-sequencer story IDs response missing 'results' key: {response_data}")
+                return []
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Error fetching all story IDs: {e.response.status_code} - {e.response.text}")
+            return []
+        except httpx.RequestError as e:
+            logger.error(f"Network error fetching all story IDs: {e}")
+            return []
+
+def _transform_story_to_dify_format(story: dict, service_name: str) -> dict:
+    """스토리 데이터를 Dify Document Upload API 형식으로 변환합니다."""
+    return {
+        "text": story.get("content", ""),
+        "meta": {
+            "user_id": story.get("user_id"),
+            "story_id": story.get("id"),
+            "title": story.get("title", ""),
+            "created_at": story.get("created_at"),
+            "updated_at": story.get("updated_at"),
+            "source": service_name
         }
+    }
 
-    async def sync_stories(self):
-        logger.info(f"Starting story synchronization for {self.service_name}...")
-        new_stories = await self.fetch_new_stories()
-        if not new_stories:
-            logger.info("No new stories to sync.")
-            return
+async def sync_stories(db: Session):
+    """스토리를 동기화하고 Dify 형식으로 변환합니다."""
+    logger.info("Starting story synchronization...")
+    
+    story_sequencer_url = Config.STORY_SEQUENCER_SERVICE_URL
+    service_name = "story-sequencer"
 
-        latest_timestamp = await self.get_last_synced_timestamp()
+    # 1. 새로 생성되거나 업데이트된 스토리 동기화
+    new_stories = await _fetch_new_stories(
+        db, story_sequencer_url, service_name
+    )
+    
+    if not new_stories:
+        logger.info("No new stories to sync.")
+    else:
+        latest_timestamp = await _get_last_synced_timestamp(db, service_name)
         for story in new_stories:
             # Dify 업로드 로직 (다음 태스크에서 구현 예정)
-            dify_data = self.transform_story_to_dify_format(story)
+            dify_data = _transform_story_to_dify_format(story, service_name)
             logger.info(f"Transformed story for Dify: {dify_data}")
             
             # 마지막 동기화 타임스탬프 업데이트
@@ -79,5 +119,33 @@ class StorySyncService:
             if story_updated_at > latest_timestamp:
                 latest_timestamp = story_updated_at
 
-        self.update_last_synced_timestamp(latest_timestamp)
+        _update_last_synced_timestamp(db, service_name, latest_timestamp)
         logger.info(f"Story synchronization completed. Last synced timestamp updated to {latest_timestamp}")
+
+    # 2. 삭제된 스토리 처리 (스냅샷 비교)
+    current_story_ids_on_sequencer = set(await _fetch_all_story_ids(story_sequencer_url))
+    
+    metadata = db.query(SyncMetadata).filter_by(service_name=service_name).first()
+    synced_story_ids_str = metadata.synced_story_ids if metadata and metadata.synced_story_ids else "[]"
+    synced_story_ids_on_dify = set(json.loads(synced_story_ids_str))
+
+    deleted_story_ids = synced_story_ids_on_dify - current_story_ids_on_sequencer
+
+    if deleted_story_ids:
+        logger.info(f"Found deleted stories: {deleted_story_ids}. Deleting from Dify...")
+        for deleted_id in deleted_story_ids:
+            # Dify에서 문서 삭제 로직 (다음 태스크에서 구현 예정)
+            logger.info(f"[Dify Delete Placeholder] Deleting story with ID: {deleted_id} from Dify.")
+    else:
+        logger.info("No stories to delete from Dify.")
+
+    # 3. 동기화된 ID 목록 업데이트
+    updated_synced_story_ids = list(current_story_ids_on_sequencer)
+    if metadata:
+        metadata.synced_story_ids = json.dumps(updated_synced_story_ids)
+    else:
+        db.add(SyncMetadata(service_name=service_name, synced_story_ids=json.dumps(updated_synced_story_ids)))
+    db.commit()
+    logger.info("Synced story IDs updated in metadata.")
+
+    logger.info("Full story synchronization process completed.")

@@ -2,8 +2,9 @@ from fastapi import FastAPI
 from app.config.config import Config
 from app.utils.logger import setup_logging
 from app.utils.db import Base, engine, SessionLocal
-from app.core.story_sync_service import StorySyncService
+from app.core.story_sync_service import sync_stories # StorySyncService 대신 sync_stories 함수 임포트
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from app.api.sync_router import router as sync_router # sync_router 임포트
 import logging
 
 logger = logging.getLogger(__name__)
@@ -13,18 +14,19 @@ def create_app():
     app = FastAPI()
     scheduler = AsyncIOScheduler()
 
+    app.include_router(sync_router) # sync_router 포함
+
     @app.on_event("startup")
     async def startup_event():
         logger.info("Application startup event triggered.")
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created/checked.")
 
-        # StorySyncService 초기화 및 스케줄러 등록
+        # 스케줄러 등록
         db = SessionLocal()
         try:
-            story_sync_service = StorySyncService(db)
-            # 매 5분마다 story_sync_service.sync_stories 호출
-            scheduler.add_job(story_sync_service.sync_stories, 'interval', minutes=5)
+            # 매 5분마다 sync_stories 함수 호출, db 세션을 인자로 전달
+            scheduler.add_job(sync_stories, 'interval', minutes=5, args=[db])
             scheduler.start()
             logger.info("Scheduler started for story synchronization.")
         finally:
