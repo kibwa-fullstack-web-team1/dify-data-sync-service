@@ -25,8 +25,8 @@ def create_app():
         # 스케줄러 등록
         db = SessionLocal()
         try:
-            # 매 5분마다 sync_stories 함수 호출, db 세션을 인자로 전달
-            scheduler.add_job(sync_stories, 'interval', minutes=5, args=[db])
+            # 매 5분마다 sync_stories 함수 호출, db 세션과 user_id=None을 인자로 전달
+            scheduler.add_job(sync_stories, 'interval', minutes=5, args=[db, None])
             scheduler.start()
             logger.info("Scheduler started for story synchronization.")
         finally:

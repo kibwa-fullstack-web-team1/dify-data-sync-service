@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from app.utils.db import get_db
 from app.core.story_sync_service import sync_stories # StorySyncService 대신 sync_stories 함수 임포트
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -12,11 +13,11 @@ router = APIRouter(
 )
 
 @router.post("/stories")
-async def trigger_story_sync(db: Session = Depends(get_db)):
+async def trigger_story_sync(user_id: Optional[int] = None, db: Session = Depends(get_db)):
     """수동으로 story-sequencer 데이터 동기화를 트리거합니다."""
-    logger.info("Manual story synchronization triggered.")
+    logger.info(f"Manual story synchronization triggered for user_id: {user_id}.")
     try:
-        await sync_stories(db) # sync_stories 함수 직접 호출
+        await sync_stories(db, user_id) # sync_stories 함수에 user_id 전달
         return {"message": "Story synchronization initiated successfully.", "status": "success"}
     except Exception as e:
         logger.error(f"Error during manual story synchronization: {e}")
