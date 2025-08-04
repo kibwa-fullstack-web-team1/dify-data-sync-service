@@ -1,14 +1,18 @@
-from sqlalchemy import Column, Integer, String, DateTime
-from sqlalchemy.sql import func
+from sqlalchemy import Column, Integer, String, DateTime, func, UniqueConstraint
 from app.utils.db import Base
 
 class SyncMetadata(Base):
     __tablename__ = "sync_metadata"
 
     id = Column(Integer, primary_key=True, index=True)
-    service_name = Column(String, unique=True, index=True, nullable=False)
+    # user_id와 service_name 조합이 고유하도록 설정
+    user_id = Column(Integer, index=True, nullable=False)
+    service_name = Column(String, index=True, nullable=False)
+    dify_dataset_id = Column(String, nullable=True) # Dify Dataset ID 저장용 컬럼 추가
     last_synced_timestamp = Column(DateTime(timezone=True), nullable=True)
-    last_synced_id = Column(String, nullable=True)
-    synced_story_ids = Column(String, nullable=True) # 동기화된 이야기 ID 목록을 JSON 문자열로 저장
+    synced_story_ids = Column(String, nullable=True) # 기존 JSON 문자열 저장 방식 유지
     created_at = Column(DateTime(timezone=True), default=func.now())
     updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+    # user_id와 service_name이 항상 쌍으로 유일해야 함을 보장
+    __table_args__ = (UniqueConstraint('user_id', 'service_name', name='_user_service_uc'),)
