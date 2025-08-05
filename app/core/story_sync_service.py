@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.config.config import Config
 from app.models.sync_metadata import SyncMetadata
 import json
-from app.utils.db import get_story_sequencer_db, get_db as get_dify_db # get_db를 get_dify_db로 별칭 변경
+from app.utils.db import get_story_sequencer_db, get_db as get_dify_db
 from app.models.story_sequencer_models import Story
 from typing import Optional, Dict, Any, List
 import httpx
@@ -36,28 +36,37 @@ def _update_last_synced_timestamp(db: Session, metadata: SyncMetadata, new_times
     metadata.last_synced_timestamp = new_timestamp
     db.commit()
 
-async def _fetch_stories(db: Session, user_id: int, service_name: str, full_resync: bool = False) -> list:
+async def _fetch_stories(db: Session, user_ids: List[int], service_name: str, full_resync: bool = False) -> list:
     story_sequencer_db = next(get_story_sequencer_db())
     try:
         if full_resync:
-            logger.info(f"Fetching all stories for user_id: {user_id} for full resync.")
-            query = story_sequencer_db.query(Story).filter(Story.user_id == user_id)
+            logger.info(f"Fetching all stories for user_ids: {user_ids} for full resync.")
+            query = story_sequencer_db.query(Story).filter(Story.user_id.in_(user_ids))
         else:
-            last_synced = await _get_last_synced_timestamp(db, user_id, service_name)
-            logger.info(f"Fetching new stories since {last_synced} for user_id: {user_id}.")
+            # 각 사용자 ID별로 마지막 동기화 시간을 가져와서 쿼리
+            # 이 부분은 복잡해질 수 있으므로, 일단 모든 user_ids에 대해 최신 업데이트된 스토리를 가져오는 방식으로 단순화
+            # 실제 구현에서는 각 user_id별로 last_synced_timestamp를 관리해야 함
+            # 현재는 senior_user_id 기준으로만 last_synced_timestamp를 관리하므로, 모든 user_ids에 대해 최신 스토리를 가져옴
+            latest_synced_time = datetime.min.replace(tzinfo=timezone.utc)
+            for user_id in user_ids:
+                last_synced = await _get_last_synced_timestamp(db, user_id, service_name)
+                if last_synced > latest_synced_time:
+                    latest_synced_time = last_synced
+
+            logger.info(f"Fetching new stories since {latest_synced_time} for user_ids: {user_ids}.")
             query = story_sequencer_db.query(Story).filter(
-                Story.user_id == user_id,
-                Story.updated_at >= (last_synced.replace(tzinfo=None) if last_synced.tzinfo else last_synced)
+                Story.user_id.in_(user_ids),
+                Story.updated_at >= (latest_synced_time.replace(tzinfo=None) if latest_synced_time.tzinfo else latest_synced_time)
             )
         stories = query.all()
         return [story.__dict__ for story in stories]
     finally:
         story_sequencer_db.close()
 
-async def _fetch_all_story_ids_for_user(user_id: int) -> list:
+async def _fetch_all_story_ids_for_user(user_ids: List[int]) -> list:
     story_sequencer_db = next(get_story_sequencer_db())
     try:
-        query = story_sequencer_db.query(Story.id).filter(Story.user_id == user_id)
+        query = story_sequencer_db.query(Story.id).filter(Story.user_id.in_(user_ids))
         return [story_id[0] for story_id in query.all()]
     finally:
         story_sequencer_db.close()
@@ -94,69 +103,8 @@ async def sync_stories(db: Optional[Session] = None, guardian_user_id: Optional[
             logger.error(f"No senior user found for guardian_user_id: {guardian_user_id}. Aborting sync.")
             return
 
-        logger.info(f"Starting story synchronization for guardian_user_id: {guardian_user_id} (senior_user_id: {senior_user_id})...")
-        service_name = "story-sequencer"
-
-        async with httpx.AsyncClient() as client:
-            dataset_id = await get_or_create_dataset_id(db, client, senior_user_id, service_name)
-            if not dataset_id:
-                logger.error(f"Failed to get or create a dataset_id for senior_user_id: {senior_user_id}. Aborting sync.")
-                return
-
-            metadata = db.query(SyncMetadata).filter_by(user_id=senior_user_id, service_name=service_name).first()
-            if not metadata:
-                metadata = SyncMetadata(user_id=senior_user_id, service_name=service_name, dify_dataset_id=dataset_id, synced_story_ids=json.dumps([]))
-                db.add(metadata)
-                db.commit()
-                db.refresh(metadata)
-
-            synced_docs_list: List[Dict[str, Any]] = json.loads(metadata.synced_story_ids) if metadata.synced_story_ids else []
-            synced_docs_map = {doc["story_id"]: doc["dify_document_id"] for doc in synced_docs_list}
-
-            stories_to_sync = await _fetch_stories(db, guardian_user_id, service_name, full_resync=full_resync)
-            latest_timestamp = await _get_last_synced_timestamp(db, senior_user_id, service_name)
-            
-            if stories_to_sync:
-                for story in stories_to_sync:
-                    dify_data = _transform_story_to_dify_format(story)
-                    file_id = await upload_file_and_get_id(client, senior_user_id, dify_data)
-                    if file_id:
-                        document_id = await create_document_from_file(client, dataset_id, file_id, dify_data)
-                        if document_id:
-                            synced_docs_map[story.get("id")] = document_id
-                    
-                    story_updated_at = story.get("updated_at", datetime.min)
-                    if story_updated_at.tzinfo is None:
-                        story_updated_at = story_updated_at.replace(tzinfo=timezone.utc)
-                    if story_updated_at > latest_timestamp:
-                        latest_timestamp = story_updated_at
-                
-                _update_last_synced_timestamp(db, metadata, latest_timestamp)
-                logger.info(f"Story upload process completed for senior_user_id {senior_user_id}.")
-            else:
-                logger.info(f"No new stories to sync for guardian_user_id {guardian_user_id}.")
-
-            if not full_resync:
-                # Fetch all story IDs for the guardian, as stories are linked to the guardian in story-sequencer
-                current_story_ids = set(await _fetch_all_story_ids_for_user(guardian_user_id))
-                deleted_story_ids = set(synced_docs_map.keys()) - current_story_ids
-                
-                if deleted_story_ids:
-                    logger.info(f"Found {len(deleted_story_ids)} deleted stories for guardian_user_id {guardian_user_id}. Deleting from Dify...")
-                    delete_tasks = []
-                    for story_id in deleted_story_ids:
-                        doc_id_to_delete = synced_docs_map.pop(story_id, None)
-                        if doc_id_to_delete:
-                            delete_tasks.append(delete_document_from_dify(client, dataset_id, doc_id_to_delete))
-                    await asyncio.gather(*delete_tasks)
-                    logger.info(f"Deletion process completed for senior_user_id {senior_user_id}.")
-                else:
-                    logger.info(f"No stories to delete for guardian_user_id {guardian_user_id}.")
-
-        updated_synced_docs_list = [{"story_id": k, "dify_document_id": v} for k, v in synced_docs_map.items()]
-        metadata.synced_story_ids = json.dumps(updated_synced_docs_list)
-        db.commit()
-        logger.info(f"Synced document map updated for senior_user_id {senior_user_id}.")
+        # sync_stories_for_senior 함수를 호출하여 실제 동기화 로직을 수행
+        await sync_stories_for_senior(senior_user_id, db=db, full_resync=full_resync)
         logger.info(f"Full story synchronization process completed for guardian_user_id: {guardian_user_id} (senior_user_id: {senior_user_id}).")
     finally:
         if db_session:
@@ -225,21 +173,74 @@ async def sync_stories_for_senior(senior_user_id: int, db: Optional[Session] = N
             db = db_session
         
         logger.info(f"Starting story synchronization for senior_user_id: {senior_user_id} (full_resync: {full_resync})...")
-        
-        # 시니어와 연결된 모든 보호자 ID를 가져옵니다.
-        guardian_ids = await get_guardian_ids_for_senior(senior_user_id)
-        
-        if not guardian_ids:
-            logger.warning(f"No guardians found for senior_user_id: {senior_user_id}. Skipping synchronization.")
-            return
+        service_name = "story-sequencer"
 
-        # 각 보호자 ID에 대해 동기화를 트리거합니다.
-        # Dify 데이터셋은 시니어 단위로 관리되므로, 어떤 보호자를 통해 호출해도 동일한 시니어의 데이터셋에 동기화됩니다.
-        for guardian_id in guardian_ids:
-            logger.info(f"Triggering sync_stories for guardian_user_id: {guardian_id} (senior_user_id: {senior_user_id})...")
-            await sync_stories(db, guardian_id, full_resync=full_resync)
-        
-        logger.info(f"Story synchronization for senior_user_id: {senior_user_id} completed.")
+        # 시니어 본인 ID와 연결된 모든 보호자 ID를 가져옵니다.
+        guardian_ids = await get_guardian_ids_for_senior(senior_user_id)
+        story_creator_ids = [senior_user_id] + guardian_ids
+        logger.info(f"Story creator IDs for senior_user_id {senior_user_id}: {story_creator_ids}")
+
+        async with httpx.AsyncClient() as client:
+            dataset_id = await get_or_create_dataset_id(db, client, senior_user_id, service_name)
+            if not dataset_id:
+                logger.error(f"Failed to get or create a dataset_id for senior_user_id: {senior_user_id}. Aborting sync.")
+                return
+
+            metadata = db.query(SyncMetadata).filter_by(user_id=senior_user_id, service_name=service_name).first()
+            if not metadata:
+                metadata = SyncMetadata(user_id=senior_user_id, service_name=service_name, dify_dataset_id=dataset_id, synced_story_ids=json.dumps([]))
+                db.add(metadata)
+                db.commit()
+                db.refresh(metadata)
+
+            synced_docs_list: List[Dict[str, Any]] = json.loads(metadata.synced_story_ids) if metadata.synced_story_ids else []
+            synced_docs_map = {doc["story_id"]: doc["dify_document_id"] for doc in synced_docs_list}
+
+            stories_to_sync = await _fetch_stories(db, story_creator_ids, service_name, full_resync=full_resync)
+            latest_timestamp = await _get_last_synced_timestamp(db, senior_user_id, service_name)
+            
+            if stories_to_sync:
+                for story in stories_to_sync:
+                    dify_data = _transform_story_to_dify_format(story)
+                    file_id = await upload_file_and_get_id(client, senior_user_id, dify_data)
+                    if file_id:
+                        document_id = await create_document_from_file(client, dataset_id, file_id, dify_data)
+                        if document_id:
+                            synced_docs_map[story.get("id")] = document_id
+                    
+                    story_updated_at = story.get("updated_at", datetime.min)
+                    if story_updated_at.tzinfo is None:
+                        story_updated_at = story_updated_at.replace(tzinfo=timezone.utc)
+                    if story_updated_at > latest_timestamp:
+                        latest_timestamp = story_updated_at
+                
+                _update_last_synced_timestamp(db, metadata, latest_timestamp)
+                logger.info(f"Story upload process completed for senior_user_id {senior_user_id}.")
+            else:
+                logger.info(f"No new stories to sync for senior_user_id {senior_user_id}.")
+
+            if not full_resync:
+                # Fetch all story IDs for the story creators, as stories are linked to them in story-sequencer
+                current_story_ids = set(await _fetch_all_story_ids_for_user(story_creator_ids))
+                deleted_story_ids = set(synced_docs_map.keys()) - current_story_ids
+                
+                if deleted_story_ids:
+                    logger.info(f"Found {len(deleted_story_ids)} deleted stories for senior_user_id {senior_user_id}. Deleting from Dify...")
+                    delete_tasks = []
+                    for story_id in deleted_story_ids:
+                        doc_id_to_delete = synced_docs_map.pop(story_id, None)
+                        if doc_id_to_delete:
+                            delete_tasks.append(delete_document_from_dify(client, dataset_id, doc_id_to_delete))
+                    await asyncio.gather(*delete_tasks)
+                    logger.info(f"Deletion process completed for senior_user_id {senior_user_id}.")
+                else:
+                    logger.info(f"No stories to delete for senior_user_id {senior_user_id}.")
+
+        updated_synced_docs_list = [{"story_id": k, "dify_document_id": v} for k, v in synced_docs_map.items()]
+        metadata.synced_story_ids = json.dumps(updated_synced_docs_list)
+        db.commit()
+        logger.info(f"Synced document map updated for senior_user_id {senior_user_id}.")
+        logger.info(f"Full story synchronization process completed for senior_user_id: {senior_user_id}.")
     finally:
         if db_session:
             db_session.close()
