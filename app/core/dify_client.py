@@ -9,6 +9,38 @@ import json
 
 logger = logging.getLogger(__name__)
 
+async def get_dify_metadata_fields(client: httpx.AsyncClient, dataset_id: str) -> Optional[Dict[str, str]]:
+    access_token = await get_dify_access_token(client)
+    if not access_token:
+        return None
+
+    url = f"{Config.DIFY_API_URL}/console/api/datasets/{dataset_id}" # Changed endpoint
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    try:
+        response = await client.get(url, headers=headers, timeout=10.0)
+        response.raise_for_status()
+        result = response.json()
+        
+        metadata_fields = {}
+        # Check for 'doc_metadata' key in the response
+        if 'doc_metadata' in result and isinstance(result['doc_metadata'], list):
+            for field in result['doc_metadata']:
+                if 'name' in field and 'id' in field:
+                    metadata_fields[field["name"]] = field["id"]
+        else:
+            logger.warning(f"No 'doc_metadata' found or it's not a list in Dify dataset response for {dataset_id}. Response: {result}")
+            return None
+
+        logger.info(f"Successfully obtained Dify metadata fields for dataset {dataset_id}.")
+        return metadata_fields
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error obtaining Dify metadata fields: {e.response.status_code} - {e.response.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Error obtaining Dify metadata fields: {e}")
+        return None
+
 async def get_dify_access_token(client: httpx.AsyncClient) -> Optional[str]:
     if not Config.DIFY_API_URL:
         logger.warning("DIFY_API_URL is not set. Cannot obtain Dify access token.")
@@ -96,8 +128,8 @@ async def create_document_from_file(client: httpx.AsyncClient, dataset_id: str, 
             "segmentation": {
                 "separator": "\n",
                 "max_tokens": 500
-            },
-            "metadata": data.get("meta", {})
+            }
+            # "doc_metadata": data.get("meta", {}) # 문서 생성 시 메타데이터 직접 포함 불가
         }
         
         response = await client.post(url, json=payload, headers=headers, timeout=60.0)
@@ -124,6 +156,48 @@ async def create_document_from_file(client: httpx.AsyncClient, dataset_id: str, 
         logger.error(f"Error creating document for story_id {data['meta']['story_id']}: {e}")
     return None
 
+async def update_document_metadata(client: httpx.AsyncClient, dataset_id: str, document_id: str, metadata: Dict[str, Any]) -> bool:
+    access_token = await get_dify_access_token(client)
+    if not access_token:
+        return False
+
+    metadata_fields_map = await get_dify_metadata_fields(client, dataset_id)
+    if not metadata_fields_map:
+        logger.error(f"Failed to retrieve metadata fields map for dataset {dataset_id}. Cannot update metadata.")
+        return False
+    
+    url = f"{Config.DIFY_API_URL}/console/api/datasets/{dataset_id}/documents/metadata"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    
+    try:
+        operation_data = []
+        metadata_list = []
+        for key, value in metadata.items():
+            field_id = metadata_fields_map.get(key)
+            if field_id:
+                metadata_list.append({"id": field_id, "name": key, "value": value})
+            else:
+                logger.warning(f"Metadata field '{key}' not found in Dify dataset {dataset_id}. Skipping.")
+
+        if not metadata_list:
+            logger.info(f"No valid metadata fields to update for document {document_id}.")
+            return True # No metadata to update, consider it successful
+
+        operation_data.append({"document_id": document_id, "metadata_list": metadata_list})
+
+        payload = {"operation_data": operation_data}
+
+        response = await client.post(url, json=payload, headers=headers, timeout=60.0)
+        response.raise_for_status()
+        logger.info(f"Successfully updated metadata for document {document_id} in dataset {dataset_id}.")
+        return True
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error updating metadata for document {document_id}: {e.response.status_code} - {e.response.text}")
+        return False
+    except Exception as e:
+        logger.error(f"Error updating metadata for document {document_id}: {e}")
+        return False
+
 async def delete_document_from_dify(client: httpx.AsyncClient, dataset_id: str, document_id: str):
     access_token = await get_dify_access_token(client)
     if not access_token:
@@ -140,6 +214,7 @@ async def delete_document_from_dify(client: httpx.AsyncClient, dataset_id: str, 
         logger.error(f"HTTP error deleting document {document_id}: {e.response.status_code} - {e.response.text}")
     except Exception as e:
         logger.error(f"Error deleting document {document_id}: {e}")
+    return None
 
 async def get_user_llm_metadata(db: Session, guardian_user_id: int) -> Dict[str, Any]:
     from app.core.user_service_client import get_senior_id_from_guardian_id

@@ -17,7 +17,8 @@ from app.core.dify_client import (
     create_document_from_file,
     delete_document_from_dify,
     get_user_llm_metadata,
-    get_user_llm_context
+    get_user_llm_context,
+    update_document_metadata # 새로 추가된 함수 임포트
 )
 
 logger = logging.getLogger(__name__)
@@ -42,23 +43,10 @@ async def _fetch_stories(db: Session, user_ids: List[int], service_name: str, fu
             query = story_sequencer_db.query(Story).filter(Story.user_id.in_(user_ids))
         else:
             latest_synced_time = datetime.min.replace(tzinfo=timezone.utc)
-            # senior_user_id를 기준으로 마지막 동기화 시간을 가져옵니다.
-            # story_creator_ids에 포함된 모든 사용자는 동일한 senior_user_id를 공유하므로, 대표 ID 하나로 조회합니다.
-            # 여기서는 user_ids[0]를 사용하지만, 실제로는 senior_user_id를 직접 사용하는 것이 더 명확합니다.
-            # 이 함수는 sync_stories_for_senior에서 호출되므로, senior_user_id를 인자로 받는 것이 좋습니다.
-            # 지금은 기존 구조를 유지하고, user_ids 리스트의 첫번째 사용자를 기준으로 조회합니다.
             if user_ids:
-                # user_id가 아닌 senior_user_id를 기준으로 timestamp를 가져와야 합니다.
-                # 이 함수를 호출하는 곳에서 senior_user_id를 알고 있으므로, 그 값을 사용해야 합니다.
-                # 현재 구조에서는 user_ids에 시니어와 보호자가 섞여있으므로, 이 문제를 해결해야 합니다.
-                # 가장 간단한 해결책은 이 함수의 호출부에서 senior_id를 넘겨주는 것입니다.
-                # 지금은 첫번째 user_id로 가정하고 진행하지만, 리팩토링이 필요한 부분입니다.
-                pass # timestamp 로직은 sync_stories_for_senior에서 직접 처리
+                pass
 
             logger.info(f"Fetching new stories for user_ids: {user_ids}.")
-            # last_synced_timestamp는 senior_user_id 기준으로 관리되므로, 개별 스토리를 시간으로 필터링하는 로직을 수정합니다.
-            # full_resync가 아닐 경우, updated_at을 기준으로 새로운 스토리를 가져옵니다.
-            # 이 로직은 sync_stories_for_senior에서 처리되므로 여기서는 모든 스토리를 가져옵니다.
             query = story_sequencer_db.query(Story).filter(Story.user_id.in_(user_ids))
 
         stories = query.all()
@@ -82,8 +70,6 @@ def _sanitize_title_for_filename(title: str) -> str:
     return title[:50]
 
 def _transform_story_to_dify_format(story: dict, senior_user_id: int, service_name: str) -> dict:
-    created_at_iso = story.get("created_at").isoformat() if story.get("created_at") else None
-    updated_at_iso = story.get("updated_at").isoformat() if story.get("updated_at") else None
     author_user_id = story.get("user_id")
     story_id = story.get("id")
     title = story.get("title", "")
@@ -96,13 +82,10 @@ def _transform_story_to_dify_format(story: dict, senior_user_id: int, service_na
         "name": file_name,
         "meta": {
             "service_name": service_name,
-            "author_user_id": author_user_id,
+            "author_user_id": author_user_id, 
             "senior_user_id": senior_user_id,
             "story_id": story_id,
             "title": title,
-            "created_at": created_at_iso,
-            "updated_at": updated_at_iso,
-            "source": "story-sequencer"
         },
         "indexing_technique": "high_quality"
     }
@@ -219,7 +202,6 @@ async def sync_stories_for_senior(senior_user_id: int, db: Optional[Session] = N
         last_synced_timestamp = await _get_last_synced_timestamp(db, senior_user_id, service_name)
         stories_to_sync = await _fetch_stories(db, story_creator_ids, service_name, full_resync=full_resync)
         
-        # Filter stories based on last_synced_timestamp if not a full resync
         if not full_resync:
             stories_to_sync = [s for s in stories_to_sync if s['updated_at'].replace(tzinfo=timezone.utc) > last_synced_timestamp]
 
@@ -236,6 +218,8 @@ async def sync_stories_for_senior(senior_user_id: int, db: Optional[Session] = N
                     if file_id:
                         document_id = await create_document_from_file(client, dataset_id, file_id, dify_data)
                         if document_id:
+                            # 문서 생성 후 메타데이터 업데이트
+                            await update_document_metadata(client, dataset_id, document_id, dify_data["meta"])
                             synced_docs_map[story.get("id")] = document_id
                     
                     story_updated_at = story.get("updated_at", datetime.min)
