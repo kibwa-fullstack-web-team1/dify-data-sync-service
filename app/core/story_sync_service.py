@@ -1,12 +1,10 @@
 import logging
-import re
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from app.config.config import Config
 from app.models.sync_metadata import SyncMetadata
 import json
-from app.utils.db import get_story_sequencer_db, get_db as get_dify_db
-from app.models.story_sequencer_models import Story
+from app.utils.db import get_db as get_dify_db
 from typing import Optional, Dict, Any, List
 import httpx
 import asyncio
@@ -18,77 +16,18 @@ from app.core.dify_client import (
     delete_document_from_dify,
     get_user_llm_metadata,
     get_user_llm_context,
-    update_document_metadata # 새로 추가된 함수 임포트
+    update_document_metadata
+)
+from app.helper.story_sync_helper import (
+    get_last_synced_timestamp,
+    update_last_synced_timestamp,
+    fetch_stories,
+    fetch_all_story_ids_for_user,
+    sanitize_title_for_filename,
+    transform_story_to_dify_format
 )
 
 logger = logging.getLogger(__name__)
-
-# --- Helper Functions ---
-
-async def _get_last_synced_timestamp(db: Session, user_id: int, service_name: str) -> datetime:
-    metadata = db.query(SyncMetadata).filter_by(user_id=user_id, service_name=service_name).first()
-    if metadata and metadata.last_synced_timestamp:
-        return metadata.last_synced_timestamp
-    return datetime.min.replace(tzinfo=timezone.utc)
-
-def _update_last_synced_timestamp(db: Session, metadata: SyncMetadata, new_timestamp: datetime):
-    metadata.last_synced_timestamp = new_timestamp
-    db.commit()
-
-async def _fetch_stories(db: Session, user_ids: List[int], service_name: str, full_resync: bool = False) -> list:
-    story_sequencer_db = next(get_story_sequencer_db())
-    try:
-        if full_resync:
-            logger.info(f"Fetching all stories for user_ids: {user_ids} for full resync.")
-            query = story_sequencer_db.query(Story).filter(Story.user_id.in_(user_ids))
-        else:
-            latest_synced_time = datetime.min.replace(tzinfo=timezone.utc)
-            if user_ids:
-                pass
-
-            logger.info(f"Fetching new stories for user_ids: {user_ids}.")
-            query = story_sequencer_db.query(Story).filter(Story.user_id.in_(user_ids))
-
-        stories = query.all()
-        return [story.__dict__ for story in stories]
-    finally:
-        story_sequencer_db.close()
-
-async def _fetch_all_story_ids_for_user(user_ids: List[int]) -> list:
-    story_sequencer_db = next(get_story_sequencer_db())
-    try:
-        query = story_sequencer_db.query(Story.id).filter(Story.user_id.in_(user_ids))
-        return [story_id[0] for story_id in query.all()]
-    finally:
-        story_sequencer_db.close()
-
-def _sanitize_title_for_filename(title: str) -> str:
-    if not title:
-        return ""
-    title = re.sub(r'[\\/:*?"<>|]', '', title)
-    title = re.sub(r'\s+', '_', title)
-    return title[:50]
-
-def _transform_story_to_dify_format(story: dict, senior_user_id: int, service_name: str) -> dict:
-    author_user_id = story.get("user_id")
-    story_id = story.get("id")
-    title = story.get("title", "")
-    sanitized_title = _sanitize_title_for_filename(title)
-
-    file_name = f"user_{author_user_id}_story_{story_id}_{sanitized_title}"
-
-    return {
-        "text": story.get("content", ""),
-        "name": file_name,
-        "meta": {
-            "service_name": service_name,
-            "author_user_id": author_user_id, 
-            "senior_user_id": senior_user_id,
-            "story_id": story_id,
-            "title": title,
-        },
-        "indexing_technique": "high_quality"
-    }
 
 # --- Main Service Logic ---
 
@@ -199,8 +138,8 @@ async def sync_stories_for_senior(senior_user_id: int, db: Optional[Session] = N
             db.commit()
             db.refresh(metadata)
 
-        last_synced_timestamp = await _get_last_synced_timestamp(db, senior_user_id, service_name)
-        stories_to_sync = await _fetch_stories(db, story_creator_ids, service_name, full_resync=full_resync)
+        last_synced_timestamp = await get_last_synced_timestamp(db, senior_user_id, service_name)
+        stories_to_sync = await fetch_stories(db, story_creator_ids, service_name, full_resync=full_resync)
         
         if not full_resync:
             stories_to_sync = [s for s in stories_to_sync if s['updated_at'].replace(tzinfo=timezone.utc) > last_synced_timestamp]
@@ -213,7 +152,7 @@ async def sync_stories_for_senior(senior_user_id: int, db: Optional[Session] = N
             
             if stories_to_sync:
                 for story in stories_to_sync:
-                    dify_data = _transform_story_to_dify_format(story, senior_user_id, service_name)
+                    dify_data = transform_story_to_dify_format(story, senior_user_id, service_name)
                     file_id = await upload_file_and_get_id(client, story.get("user_id"), dify_data)
                     if file_id:
                         document_id = await create_document_from_file(client, dataset_id, file_id, dify_data)
@@ -228,13 +167,13 @@ async def sync_stories_for_senior(senior_user_id: int, db: Optional[Session] = N
                     if story_updated_at > latest_timestamp:
                         latest_timestamp = story_updated_at
                 
-                _update_last_synced_timestamp(db, metadata, latest_timestamp)
+                update_last_synced_timestamp(db, metadata, latest_timestamp)
                 logger.info(f"Story upload process completed for senior_user_id {senior_user_id}.")
             else:
                 logger.info(f"No new stories to sync for senior_user_id {senior_user_id}.")
 
             if not full_resync:
-                current_story_ids = set(await _fetch_all_story_ids_for_user(story_creator_ids))
+                current_story_ids = set(await fetch_all_story_ids_for_user(story_creator_ids))
                 deleted_story_ids = set(synced_docs_map.keys()) - current_story_ids
                 
                 if deleted_story_ids:
