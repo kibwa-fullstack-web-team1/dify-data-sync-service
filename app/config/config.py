@@ -8,6 +8,7 @@ class Config:
     STORY_SEQUENCER_SERVICE_URL = os.getenv("STORY_SEQUENCER_SERVICE_URL", "http://story-sequencer:8011")
     DIFY_API_KEY = os.getenv("DIFY_API_KEY")
     DIFY_API_URL = os.getenv("DIFY_API_URL")
+    DIFY_DATASET_ID = os.getenv("DIFY_DATASET_ID")
     USER_SERVICE_URL = os.getenv("USER_SERVICE_URL", "http://user-service:8000")
     DATABASE_URL = os.getenv("DATABASE_URL")
     

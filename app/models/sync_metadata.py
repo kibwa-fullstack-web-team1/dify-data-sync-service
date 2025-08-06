@@ -8,7 +8,6 @@ class SyncMetadata(Base):
     # user_id와 service_name 조합이 고유하도록 설정
     user_id = Column(Integer, index=True, nullable=False)
     service_name = Column(String, index=True, nullable=False)
-    dify_dataset_id = Column(String, nullable=True) # Dify Dataset ID 저장용 컬럼 추가
     last_synced_timestamp = Column(DateTime(timezone=True), nullable=True)
     synced_story_ids = Column(String, nullable=True) # 기존 JSON 문자열 저장 방식 유지
     created_at = Column(DateTime(timezone=True), default=func.now())
